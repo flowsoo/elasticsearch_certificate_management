@@ -1,0 +1,461 @@
+---
+# ============================================================
+# ELASTICSEARCH ↔ ELASTICSEARCH
+# PKCS#12 TRANSPORT TLS DIAGNOSTIC
+#
+# READ ONLY
+#
+# Run:
+#   ansible-playbook -i inventory.ini check_es_to_es.yml
+# ============================================================
+
+- name: Elasticsearch transport PKCS#12 TLS diagnostic
+  hosts: "es01,es02,es03"
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLES
+    # ========================================================
+
+    # Elasticsearch configuration
+    es_config: "/etc/elasticsearch/elasticsearch.yml"
+
+    # Elasticsearch service
+    es_service: "elasticsearch"
+
+    # Elasticsearch transport port
+    es_transport_port: 9300
+
+    # The three Elasticsearch nodes
+    es_node_1: "es01"
+    es_node_2: "es02"
+    es_node_3: "es03"
+
+    # ========================================================
+    # END USER VARIABLES
+    # ========================================================
+
+
+  tasks:
+
+    # ========================================================
+    # HEADER
+    # ========================================================
+
+    - name: Display header
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " ELASTICSEARCH ↔ ELASTICSEARCH"
+          - " PKCS#12 TRANSPORT TLS DIAGNOSTIC"
+          - "================================================================"
+          - "Node: {{ inventory_hostname }}"
+          - ""
+
+
+    # ========================================================
+    # READ ELASTICSEARCH CONFIGURATION
+    # ========================================================
+
+    - name: Read elasticsearch.yml
+      ansible.builtin.slurp:
+        src: "{{ es_config }}"
+      register: es_config_raw
+
+
+    - name: Decode elasticsearch.yml
+      ansible.builtin.set_fact:
+        es_config_text: "{{ es_config_raw.content | b64decode }}"
+
+
+    # ========================================================
+    # DETERMINE TLS CONFIGURATION
+    # ========================================================
+
+    - name: Determine whether transport TLS is enabled
+      ansible.builtin.set_fact:
+        transport_tls_enabled: >-
+          {{
+            es_config_text is regex(
+              '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.enabled:\\s*true\\s*$'
+            )
+          }}
+
+
+    - name: Extract verification mode
+      ansible.builtin.set_fact:
+        transport_verification_mode: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.verification_mode:\\s*["'']?([^"''\\s]+)'
+                )
+              | first
+            )
+            | default('NOT EXPLICITLY CONFIGURED', true)
+          }}
+
+
+    - name: Extract PKCS#12 keystore path
+      ansible.builtin.set_fact:
+        transport_keystore: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.keystore\\.path:\\s*["'']?([^"''\\n]+)'
+                )
+              | first
+            )
+            | default('', true)
+          }}
+
+
+    - name: Extract PKCS#12 truststore path
+      ansible.builtin.set_fact:
+        transport_truststore: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.truststore\\.path:\\s*["'']?([^"''\\n]+)'
+                )
+              | first
+            )
+            | default('', true)
+          }}
+
+
+    # ========================================================
+    # RESOLVE PATHS
+    #
+    # Elasticsearch normally resolves relative paths beneath
+    # its configuration directory.
+    # ========================================================
+
+    - name: Resolve keystore path
+      ansible.builtin.set_fact:
+        resolved_keystore: >-
+          {{
+            transport_keystore
+            if transport_keystore.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ transport_keystore
+              if transport_keystore
+              else ''
+            )
+          }}
+
+
+    - name: Resolve truststore path
+      ansible.builtin.set_fact:
+        resolved_truststore: >-
+          {{
+            transport_truststore
+            if transport_truststore.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ transport_truststore
+              if transport_truststore
+              else ''
+            )
+          }}
+
+
+    # ========================================================
+    # CONFIGURATION REPORT
+    # ========================================================
+
+    - name: Display configuration
+      ansible.builtin.debug:
+        msg:
+          - "CONFIGURATION"
+          - "----------------------------------------------------------------"
+          - >-
+            Transport TLS enabled:
+            {{ 'PASS' if transport_tls_enabled else 'FAIL' }}
+          - "Verification mode: {{ transport_verification_mode }}"
+          - >-
+            PKCS#12 keystore:
+            {{ resolved_keystore if resolved_keystore else 'NOT CONFIGURED' }}
+          - >-
+            PKCS#12 truststore:
+            {{ resolved_truststore if resolved_truststore else 'NOT CONFIGURED' }}
+          - ""
+
+
+    # ========================================================
+    # CHECK FILES
+    # ========================================================
+
+    - name: Check PKCS#12 keystore
+      ansible.builtin.stat:
+        path: "{{ resolved_keystore }}"
+      register: keystore_stat
+      when: resolved_keystore | length > 0
+
+
+    - name: Check PKCS#12 truststore
+      ansible.builtin.stat:
+        path: "{{ resolved_truststore }}"
+      register: truststore_stat
+      when: resolved_truststore | length > 0
+
+
+    - name: Display file status
+      ansible.builtin.debug:
+        msg:
+          - "PKCS#12 FILES"
+          - "----------------------------------------------------------------"
+          - >-
+            Keystore exists:
+            {{
+              'PASS'
+              if keystore_stat.stat.exists | default(false)
+              else 'FAIL'
+            }}
+          - >-
+            Truststore exists:
+            {{
+              'PASS'
+              if truststore_stat.stat.exists | default(false)
+              else 'FAIL'
+            }}
+          - ""
+
+
+    # ========================================================
+    # IDENTIFY FILE TYPE
+    # ========================================================
+
+    - name: Identify keystore file
+      ansible.builtin.command:
+        cmd: "file {{ resolved_keystore }}"
+      register: keystore_file_type
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_keystore | length > 0
+        - keystore_stat.stat.exists | default(false)
+
+
+    - name: Identify truststore file
+      ansible.builtin.command:
+        cmd: "file {{ resolved_truststore }}"
+      register: truststore_file_type
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_truststore | length > 0
+        - truststore_stat.stat.exists | default(false)
+
+
+    - name: Display file types
+      ansible.builtin.debug:
+        msg:
+          - "FILE TYPE"
+          - "----------------------------------------------------------------"
+          - "Keystore: {{ keystore_file_type.stdout | default('N/A') }}"
+          - "Truststore: {{ truststore_file_type.stdout | default('N/A') }}"
+          - ""
+
+
+    # ========================================================
+    # INSPECT PKCS#12
+    #
+    # We deliberately do NOT supply or display a password.
+    #
+    # If the PKCS#12 file is password protected, OpenSSL will
+    # report that fact rather than exposing credentials.
+    # ========================================================
+
+    - name: Inspect PKCS#12 keystore structure
+      ansible.builtin.command:
+        cmd: >-
+          openssl pkcs12
+          -in "{{ resolved_keystore }}"
+          -info
+          -nokeys
+          -passin stdin
+      args:
+        stdin: ""
+      register: keystore_inspection
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - resolved_keystore | length > 0
+        - keystore_stat.stat.exists | default(false)
+
+
+    # ========================================================
+    # EXTRACT CERTIFICATE WITHOUT PRIVATE KEY
+    #
+    # First attempt without a password.
+    # This is deliberately non-destructive.
+    # ========================================================
+
+    - name: Extract certificate from PKCS#12
+      ansible.builtin.shell: |
+        openssl pkcs12 \
+          -in "{{ resolved_keystore }}" \
+          -clcerts \
+          -nokeys \
+          -passin pass: 2>/dev/null |
+        openssl x509 \
+          -noout \
+          -subject \
+          -issuer \
+          -serial \
+          -dates \
+          -fingerprint -sha256 \
+          -ext subjectAltName
+      register: transport_certificate
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - resolved_keystore | length > 0
+        - keystore_stat.stat.exists | default(false)
+
+
+    # ========================================================
+    # CERTIFICATE REPORT
+    # ========================================================
+
+    - name: Display certificate information
+      ansible.builtin.debug:
+        msg:
+          - "CERTIFICATE"
+          - "----------------------------------------------------------------"
+          - >-
+            {{
+              transport_certificate.stdout
+              if transport_certificate.stdout | default('') | length > 0
+              else
+              'Certificate could not be extracted without the PKCS#12 password.'
+            }}
+          - ""
+
+
+    # ========================================================
+    # ELASTICSEARCH SERVICE
+    # ========================================================
+
+    - name: Check Elasticsearch service
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ es_service }}"
+      register: es_service_status
+      changed_when: false
+      failed_when: false
+
+
+    - name: Check transport port
+      ansible.builtin.shell:
+        cmd: "ss -lnt | awk '$4 ~ /:{{ es_transport_port }}$/ {print}'"
+      register: transport_listener
+      changed_when: false
+      failed_when: false
+
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg:
+          - "ELASTICSEARCH SERVICE"
+          - "----------------------------------------------------------------"
+          - >-
+            Elasticsearch:
+            {{ 'PASS' if es_service_status.rc == 0 else 'FAIL' }}
+          - >-
+            Transport port {{ es_transport_port }}:
+            {{
+              'PASS - listening'
+              if transport_listener.stdout
+              else 'FAIL - not listening'
+            }}
+          - ""
+
+
+    # ========================================================
+    # LIVE TLS TEST
+    #
+    # This verifies that the transport port is actually speaking
+    # TLS and allows us to inspect the certificate presented by
+    # the remote node.
+    # ========================================================
+
+    - name: Test TLS against other Elasticsearch nodes
+      ansible.builtin.shell: |
+        timeout 10 openssl s_client \
+          -connect "{{ item }}:{{ es_transport_port }}" \
+          -servername "{{ item }}" \
+          -showcerts \
+          </dev/null 2>&1
+      loop:
+        - "{{ es_node_1 }}"
+        - "{{ es_node_2 }}"
+        - "{{ es_node_3 }}"
+      when: item != inventory_hostname
+      register: remote_tls_tests
+      changed_when: false
+      failed_when: false
+
+
+    # ========================================================
+    # DISPLAY LIVE TLS RESULTS
+    # ========================================================
+
+    - name: Display live TLS results
+      ansible.builtin.debug:
+        msg:
+          - "LIVE TRANSPORT TLS"
+          - "----------------------------------------------------------------"
+          - >-
+            {{ inventory_hostname }} → {{ item.item }}:
+            {{
+              'PASS - TLS handshake completed'
+              if item.rc == 0
+              else 'FAIL - TLS handshake failed'
+            }}
+      loop: "{{ remote_tls_tests.results }}"
+
+
+    # ========================================================
+    # FINAL SUMMARY
+    # ========================================================
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " SUMMARY: {{ inventory_hostname }}"
+          - "================================================================"
+          - >-
+            TLS enabled:
+            {{ 'PASS' if transport_tls_enabled else 'FAIL' }}
+          - >-
+            PKCS#12 keystore:
+            {{
+              'PASS'
+              if keystore_stat.stat.exists | default(false)
+              else 'FAIL'
+            }}
+          - >-
+            PKCS#12 truststore:
+            {{
+              'PASS'
+              if truststore_stat.stat.exists | default(false)
+              else 'FAIL'
+            }}
+          - >-
+            Elasticsearch:
+            {{ 'PASS' if es_service_status.rc == 0 else 'FAIL' }}
+          - >-
+            Transport port:
+            {{ 'PASS' if transport_listener.stdout else 'FAIL' }}
+          - "Live TLS: see individual node results above"
+          - "================================================================"
