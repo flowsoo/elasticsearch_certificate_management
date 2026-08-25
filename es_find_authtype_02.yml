@@ -1,0 +1,237 @@
+---
+# ============================================================
+# CHECK ELASTICSEARCH TRANSPORT TLS CONFIGURATION
+#
+# ONLY reads elasticsearch.yml
+#
+# Does NOT:
+#   - inspect certificates
+#   - inspect keystores
+#   - inspect filesystem certificate contents
+#   - test TLS
+#   - test connectivity
+#   - modify Elasticsearch
+# ============================================================
+
+- name: Determine Elasticsearch transport TLS configuration
+  hosts: "es01,es02,es03"
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLE
+    # ========================================================
+
+    es_config: "/etc/elasticsearch/elasticsearch.yml"
+
+    # ========================================================
+    # END USER VARIABLE
+    # ========================================================
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Read elasticsearch.yml
+    # --------------------------------------------------------
+
+    - name: Read elasticsearch.yml
+      ansible.builtin.slurp:
+        src: "{{ es_config }}"
+      register: es_config_raw
+
+
+    # --------------------------------------------------------
+    # Convert YAML file into an Ansible dictionary
+    # --------------------------------------------------------
+
+    - name: Parse elasticsearch.yml
+      ansible.builtin.set_fact:
+        es_settings: >-
+          {{
+            es_config_raw.content
+            | b64decode
+            | from_yaml
+          }}
+
+
+    # --------------------------------------------------------
+    # Extract transport SSL/TLS configuration
+    # --------------------------------------------------------
+
+    - name: Extract transport TLS settings
+      ansible.builtin.set_fact:
+        transport_tls_settings: >-
+          {{
+            es_settings
+            | dict2items
+            | selectattr(
+                'key',
+                'match',
+                '^xpack\.security\.transport\.ssl\.'
+              )
+            | list
+          }}
+
+
+    # --------------------------------------------------------
+    # Determine whether transport TLS is enabled
+    # --------------------------------------------------------
+
+    - name: Determine transport TLS state
+      ansible.builtin.set_fact:
+        transport_tls_enabled: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.enabled'
+            ] | default(false)
+          }}
+
+
+    # --------------------------------------------------------
+    # Determine what certificate mechanism is configured
+    # --------------------------------------------------------
+
+    - name: Determine certificate mechanism
+      ansible.builtin.set_fact:
+        uses_keystore: >-
+          {{
+            (
+              'xpack.security.transport.ssl.keystore.path'
+              in es_settings
+            )
+            or
+            (
+              'xpack.security.transport.ssl.keystore.type'
+              in es_settings
+            )
+          }}
+
+        uses_truststore: >-
+          {{
+            (
+              'xpack.security.transport.ssl.truststore.path'
+              in es_settings
+            )
+            or
+            (
+              'xpack.security.transport.ssl.truststore.type'
+              in es_settings
+            )
+          }}
+
+        uses_certificate: >-
+          {{
+            'xpack.security.transport.ssl.certificate'
+            in es_settings
+          }}
+
+        uses_private_key: >-
+          {{
+            'xpack.security.transport.ssl.key'
+            in es_settings
+          }}
+
+        uses_certificate_authorities: >-
+          {{
+            'xpack.security.transport.ssl.certificate_authorities'
+            in es_settings
+          }}
+
+
+    # --------------------------------------------------------
+    # Build human-readable mechanism description
+    # --------------------------------------------------------
+
+    - name: Determine authentication configuration
+      ansible.builtin.set_fact:
+        certificate_mechanism: >-
+          {{
+            (
+              ['KEYSTORE'] if uses_keystore else []
+            )
+            +
+            (
+              ['TRUSTSTORE'] if uses_truststore else []
+            )
+            +
+            (
+              ['CERTIFICATE'] if uses_certificate else []
+            )
+            +
+            (
+              ['PRIVATE KEY'] if uses_private_key else []
+            )
+            +
+            (
+              ['CERTIFICATE AUTHORITIES']
+              if uses_certificate_authorities
+              else []
+            )
+          }}
+
+
+    # --------------------------------------------------------
+    # Display EXACT configured transport TLS settings
+    # --------------------------------------------------------
+
+    - name: Display Elasticsearch transport TLS configuration
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " ELASTICSEARCH TRANSPORT TLS CONFIGURATION"
+          - "================================================================"
+          - ""
+          - "Node:"
+          - "  {{ inventory_hostname }}"
+          - ""
+          - "Configuration file:"
+          - "  {{ es_config }}"
+          - ""
+          - "Transport TLS enabled:"
+          - "  {{ transport_tls_enabled }}"
+          - ""
+          - "CONFIGURED TLS SETTINGS"
+          - "----------------------------------------------------------------"
+          - >-
+            {{
+              transport_tls_settings
+              | map(attribute='key')
+              | list
+            }}
+          - ""
+          - "CONFIGURED CERTIFICATE MECHANISM"
+          - "----------------------------------------------------------------"
+          - >-
+            {{
+              certificate_mechanism
+              if certificate_mechanism | length > 0
+              else ['NO EXPLICIT CERTIFICATE/KEYSTORE SETTINGS FOUND']
+            }}
+          - ""
+          - "================================================================"
+
+
+    # --------------------------------------------------------
+    # Display the ACTUAL VALUES
+    # --------------------------------------------------------
+
+    - name: Display actual configured values
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " ACTUAL VALUES FROM elasticsearch.yml"
+          - "================================================================"
+          - ""
+          - >-
+            {{
+              item.key
+            }}:
+          - >-
+            {{
+              item.value | string
+            }}
+      loop: "{{ transport_tls_settings }}"
