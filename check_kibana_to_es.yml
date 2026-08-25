@@ -1,0 +1,203 @@
+---
+# ============================================================
+# Kibana → Elasticsearch HTTPS Diagnostic
+#
+# RUN:
+#   ansible-playbook -i inventory.ini check_kibana_to_es.yml
+#
+# READ-ONLY - no configuration changes are made.
+# ============================================================
+
+- name: Kibana → Elasticsearch HTTPS Diagnostic
+  hosts: kibana
+  gather_facts: true
+  become: true
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLES - CHANGE THESE
+    # ========================================================
+
+    kibana_config_file: "/etc/kibana/kibana.yml"
+
+    kibana_service_name: "kibana"
+
+    # Elasticsearch HTTPS port
+    es_http_port: 9200
+
+    # Elasticsearch hosts as configured/reachable from Kibana
+    es_hosts:
+      - "https://es01.example.com:9200"
+      - "https://es02.example.com:9200"
+      - "https://es03.example.com:9200"
+
+    # CA that Kibana uses to trust Elasticsearch
+    kibana_es_ca: "/etc/kibana/certs/elasticsearch-ca.crt"
+
+    # Optional Elasticsearch username used for API test
+    es_username: "kibana_system"
+
+    # Password is deliberately not stored here.
+    # Set it with:
+    #
+    #   -e 'es_password=PASSWORD'
+    #
+    # or use Ansible Vault.
+    es_password: ""
+
+    # ========================================================
+    # END USER VARIABLES
+    # ========================================================
+
+  tasks:
+
+    - name: Check Kibana service
+      command: "systemctl is-active {{ kibana_service_name }}"
+      register: kibana_service
+      changed_when: false
+      failed_when: false
+
+    - name: Report Kibana service
+      debug:
+        msg: >-
+          [{% if kibana_service.rc == 0 %}PASS{% else %}FAIL{% endif %}]
+          Kibana service
+          {{ 'is running' if kibana_service.rc == 0 else 'is NOT running' }}
+
+    # --------------------------------------------------------
+    # CONFIGURATION
+    # --------------------------------------------------------
+
+    - name: Check Elasticsearch hosts configured
+      shell: |
+        grep -E '^[[:space:]]*elasticsearch\.hosts:' \
+        "{{ kibana_config_file }}"
+      register: kibana_es_hosts
+      changed_when: false
+      failed_when: false
+
+    - name: Display configured Elasticsearch hosts
+      debug:
+        msg: "{{ kibana_es_hosts.stdout | default('[NOT FOUND]') }}"
+
+    - name: Check Elasticsearch SSL CA configuration
+      shell: |
+        grep -Ei \
+        '^[[:space:]]*elasticsearch\.ssl\.(certificateAuthorities|certificate_authorities):' \
+        "{{ kibana_config_file }}"
+      register: kibana_ca_config
+      changed_when: false
+      failed_when: false
+
+    - name: Report CA configuration
+      debug:
+        msg: >-
+          [{% if kibana_ca_config.rc == 0 %}PASS{% else %}WARN{% endif %}]
+          Elasticsearch CA configuration
+          {{ 'found' if kibana_ca_config.rc == 0 else 'not found in expected form' }}
+
+    # --------------------------------------------------------
+    # CA FILE
+    # --------------------------------------------------------
+
+    - name: Check Kibana Elasticsearch CA
+      stat:
+        path: "{{ kibana_es_ca }}"
+      register: kibana_ca_stat
+
+    - name: Report CA
+      debug:
+        msg: >-
+          [{% if kibana_ca_stat.stat.exists %}PASS{% else %}FAIL{% endif %}]
+          CA file {{ kibana_es_ca }}
+
+    # --------------------------------------------------------
+    # HTTPS TESTS
+    # --------------------------------------------------------
+
+    - name: Test HTTPS/TLS from Kibana node to Elasticsearch
+      shell: |
+        curl --silent --show-error \
+          --output /dev/null \
+          --write-out '%{http_code}' \
+          --cacert "{{ kibana_es_ca }}" \
+          --connect-timeout 10 \
+          "{{ item }}"
+      loop: "{{ es_hosts }}"
+      register: es_https_tests
+      changed_when: false
+      failed_when: false
+
+    - name: Report Elasticsearch HTTPS tests
+      debug:
+        msg: >-
+          [{% if item.rc == 0 and item.stdout | int < 500 %}
+          PASS{% else %}FAIL{% endif %}]
+          {{ inventory_hostname }} → {{ item.item }}
+          HTTP={{ item.stdout | default('NO RESPONSE') }}
+      loop: "{{ es_https_tests.results }}"
+
+    # --------------------------------------------------------
+    # CERTIFICATE INFORMATION
+    # --------------------------------------------------------
+
+    - name: Inspect Elasticsearch certificate remotely
+      shell: |
+        echo | timeout 10 openssl s_client \
+          -connect "{{ item | regex_replace('^https://', '') }}" \
+          -showcerts 2>/dev/null |
+        openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+      loop: "{{ es_hosts }}"
+      register: es_cert_info
+      changed_when: false
+      failed_when: false
+
+    - name: Display Elasticsearch certificate information
+      debug:
+        msg:
+          - "{{ item.item }}"
+          - "{{ item.stdout }}"
+      loop: "{{ es_cert_info.results }}"
+
+    # --------------------------------------------------------
+    # OPTIONAL API AUTHENTICATION TEST
+    # --------------------------------------------------------
+
+    - name: Test Elasticsearch authentication
+      shell: |
+        curl --silent --show-error \
+          --cacert "{{ kibana_es_ca }}" \
+          --user "{{ es_username }}:{{ es_password }}" \
+          --connect-timeout 10 \
+          "{{ item }}/_security/_authenticate"
+      loop: "{{ es_hosts }}"
+      when: es_password | length > 0
+      register: es_auth_tests
+      changed_when: false
+      no_log: true
+      failed_when: false
+
+    - name: Report authentication result
+      debug:
+        msg: >-
+          [{% if item.rc == 0 %}PASS{% else %}FAIL{% endif %}]
+          Elasticsearch authentication test to {{ item.item }}
+      loop: "{{ es_auth_tests.results | default([]) }}"
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    - name: Diagnostic summary
+      debug:
+        msg:
+          - "============================================================"
+          - " Kibana → Elasticsearch HTTPS Diagnostic"
+          - " Node: {{ inventory_hostname }}"
+          - "============================================================"
+          - "Kibana service: {{ 'PASS' if kibana_service.rc == 0 else 'FAIL' }}"
+          - "CA exists:      {{ 'PASS' if kibana_ca_stat.stat.exists else 'FAIL' }}"
+          - "HTTPS tests:    See results above"
+          - "Authentication: Optional"
+          - "============================================================"
