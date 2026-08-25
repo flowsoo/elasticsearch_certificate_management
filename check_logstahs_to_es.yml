@@ -1,0 +1,241 @@
+---
+# ============================================================
+# Logstash → Elasticsearch HTTPS / mTLS Diagnostic
+#
+# RUN:
+#   ansible-playbook -i inventory.ini check_logstash_to_es.yml
+#
+# READ-ONLY - no configuration changes are made.
+# ============================================================
+
+- name: Logstash → Elasticsearch HTTPS/mTLS Diagnostic
+  hosts: logstash
+  gather_facts: true
+  become: true
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLES - CHANGE THESE
+    # ========================================================
+
+    logstash_config_dir: "/etc/logstash/conf.d"
+
+    logstash_service_name: "logstash"
+
+    es_http_port: 9200
+
+    es_hosts:
+      - "https://es01.example.com:9200"
+      - "https://es02.example.com:9200"
+      - "https://es03.example.com:9200"
+
+    # CA used by Logstash to validate Elasticsearch
+    logstash_es_ca: "/etc/logstash/certs/elasticsearch-ca.crt"
+
+    # Logstash client certificate, if mTLS is used
+    logstash_client_cert: "/etc/logstash/certs/logstash.crt"
+
+    # Logstash client private key
+    logstash_client_key: "/etc/logstash/certs/logstash.key"
+
+    # Set to true if Elasticsearch requires client certificates
+    expect_mtls: true
+
+    # ========================================================
+    # END USER VARIABLES
+    # ========================================================
+
+  tasks:
+
+    # --------------------------------------------------------
+    # SERVICE
+    # --------------------------------------------------------
+
+    - name: Check Logstash service
+      command: "systemctl is-active {{ logstash_service_name }}"
+      register: logstash_service
+      changed_when: false
+      failed_when: false
+
+    - name: Report Logstash service
+      debug:
+        msg: >-
+          [{% if logstash_service.rc == 0 %}PASS{% else %}FAIL{% endif %}]
+          Logstash service
+          {{ 'is running' if logstash_service.rc == 0 else 'is NOT running' }}
+
+    # --------------------------------------------------------
+    # CONFIGURATION
+    # --------------------------------------------------------
+
+    - name: Find Logstash configuration files
+      find:
+        paths: "{{ logstash_config_dir }}"
+        patterns:
+          - "*.conf"
+          - "*.cfg"
+      register: logstash_configs
+
+    - name: Search configuration for Elasticsearch output
+      shell: |
+        grep -RniE \
+        'elasticsearch|ssl|cacert|ssl_certificate|ssl_key' \
+        "{{ logstash_config_dir }}" 2>/dev/null
+      register: logstash_es_config
+      changed_when: false
+      failed_when: false
+
+    - name: Display Logstash Elasticsearch configuration
+      debug:
+        msg: "{{ logstash_es_config.stdout | default('[NOT FOUND]') }}"
+
+    # --------------------------------------------------------
+    # CA
+    # --------------------------------------------------------
+
+    - name: Check Elasticsearch CA
+      stat:
+        path: "{{ logstash_es_ca }}"
+      register: logstash_ca_stat
+
+    - name: Report Elasticsearch CA
+      debug:
+        msg: >-
+          [{% if logstash_ca_stat.stat.exists %}PASS{% else %}FAIL{% endif %}]
+          Logstash Elasticsearch CA:
+          {{ logstash_es_ca }}
+
+    # --------------------------------------------------------
+    # CLIENT CERTIFICATE
+    # --------------------------------------------------------
+
+    - name: Check Logstash client certificate
+      stat:
+        path: "{{ logstash_client_cert }}"
+      register: logstash_client_cert_stat
+
+    - name: Check Logstash client private key
+      stat:
+        path: "{{ logstash_client_key }}"
+      register: logstash_client_key_stat
+
+    - name: Report client certificate
+      debug:
+        msg:
+          - "[{{ 'PASS' if logstash_client_cert_stat.stat.exists else 'FAIL' }}] Client certificate"
+          - "[{{ 'PASS' if logstash_client_key_stat.stat.exists else 'FAIL' }}] Client private key"
+
+    # --------------------------------------------------------
+    # CLIENT CERTIFICATE VALIDITY
+    # --------------------------------------------------------
+
+    - name: Check Logstash client certificate expiry
+      shell: |
+        openssl x509 \
+          -in "{{ logstash_client_cert }}" \
+          -checkend 0 \
+          -noout
+      register: client_cert_expiry
+      when: logstash_client_cert_stat.stat.exists
+      changed_when: false
+      failed_when: false
+
+    - name: Report client certificate expiry
+      debug:
+        msg: >-
+          [{% if client_cert_expiry.rc == 0 %}PASS{% else %}FAIL{% endif %}]
+          Logstash client certificate
+          {{ 'is valid' if client_cert_expiry.rc == 0 else 'is EXPIRED' }}
+      when: logstash_client_cert_stat.stat.exists
+
+    - name: Display Logstash client certificate SAN
+      command:
+        cmd: "openssl x509 -in {{ logstash_client_cert }} -noout -subject -issuer -ext subjectAltName"
+      register: client_cert_info
+      when: logstash_client_cert_stat.stat.exists
+      changed_when: false
+      failed_when: false
+
+    - name: Report Logstash client certificate
+      debug:
+        msg: "{{ client_cert_info.stdout }}"
+      when: logstash_client_cert_stat.stat.exists
+
+    # --------------------------------------------------------
+    # HTTPS TEST
+    # --------------------------------------------------------
+
+    - name: Test Logstash node → Elasticsearch HTTPS
+      shell: |
+        curl --silent --show-error \
+          --output /dev/null \
+          --write-out '%{http_code}' \
+          --cacert "{{ logstash_es_ca }}" \
+          --connect-timeout 10 \
+          "{{ item }}"
+      loop: "{{ es_hosts }}"
+      register: es_https_tests
+      changed_when: false
+      failed_when: false
+
+    - name: Report HTTPS tests
+      debug:
+        msg: >-
+          [{% if item.rc == 0 and item.stdout | int < 500 %}
+          PASS{% else %}FAIL{% endif %}]
+          {{ inventory_hostname }} → {{ item.item }}
+          HTTP={{ item.stdout | default('NO RESPONSE') }}
+      loop: "{{ es_https_tests.results }}"
+
+    # --------------------------------------------------------
+    # mTLS TEST
+    # --------------------------------------------------------
+
+    - name: Test Logstash client certificate against Elasticsearch
+      shell: |
+        curl --silent --show-error \
+          --output /dev/null \
+          --write-out '%{http_code}' \
+          --cacert "{{ logstash_es_ca }}" \
+          --cert "{{ logstash_client_cert }}" \
+          --key "{{ logstash_client_key }}" \
+          --connect-timeout 10 \
+          "{{ item }}"
+      loop: "{{ es_hosts }}"
+      when:
+        - expect_mtls
+        - logstash_client_cert_stat.stat.exists
+        - logstash_client_key_stat.stat.exists
+        - logstash_ca_stat.stat.exists
+      register: mtls_tests
+      changed_when: false
+      failed_when: false
+
+    - name: Report mTLS tests
+      debug:
+        msg: >-
+          [{% if item.rc == 0 and item.stdout | int < 500 %}
+          PASS{% else %}FAIL{% endif %}]
+          mTLS {{ inventory_hostname }} → {{ item.item }}
+          HTTP={{ item.stdout | default('NO RESPONSE') }}
+      loop: "{{ mtls_tests.results | default([]) }}"
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    - name: Diagnostic summary
+      debug:
+        msg:
+          - "============================================================"
+          - " Logstash → Elasticsearch HTTPS/mTLS Diagnostic"
+          - " Node: {{ inventory_hostname }}"
+          - "============================================================"
+          - "Logstash service:       {{ 'PASS' if logstash_service.rc == 0 else 'FAIL' }}"
+          - "CA exists:              {{ 'PASS' if logstash_ca_stat.stat.exists else 'FAIL' }}"
+          - "Client certificate:     {{ 'PASS' if logstash_client_cert_stat.stat.exists else 'FAIL' }}"
+          - "Client private key:     {{ 'PASS' if logstash_client_key_stat.stat.exists else 'FAIL' }}"
+          - "mTLS expected:          {{ expect_mtls }}"
+          - "HTTPS/mTLS tests:       See results above"
+          - "============================================================"
