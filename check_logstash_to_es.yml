@@ -1,0 +1,192 @@
+---
+# ============================================================
+# LOGSTASH → ELASTICSEARCH HTTPS / mTLS DIAGNOSTIC
+#
+# Run:
+#   ansible-playbook -i inventory.ini check_logstash_to_es.yml
+#
+# READ ONLY
+# ============================================================
+
+- name: Logstash → Elasticsearch HTTPS/mTLS diagnostic
+  hosts: logstash
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLES
+    # ========================================================
+
+    logstash_config_dir: "/etc/logstash/conf.d"
+
+    logstash_service: "logstash"
+
+    es_hosts:
+      - "es01.example.com"
+      - "es02.example.com"
+      - "es03.example.com"
+
+    es_http_port: 9200
+
+    certificate_warning_days: 30
+
+    # ========================================================
+    # END USER VARIABLES
+    # ========================================================
+
+
+  tasks:
+
+    - name: Header
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " LOGSTASH → ELASTICSEARCH HTTPS / mTLS DIAGNOSTIC"
+          - "================================================================"
+          - "Logstash node: {{ inventory_hostname }}"
+          - ""
+
+
+    # ========================================================
+    # LOGSTASH CONFIGURATION
+    # ========================================================
+
+    - name: Find Logstash configuration
+      ansible.builtin.find:
+        paths: "{{ logstash_config_dir }}"
+        patterns:
+          - "*.conf"
+      register: logstash_config_files
+
+
+    - name: Read Logstash configuration files
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ logstash_config_files.files }}"
+      register: logstash_configs
+
+
+    - name: Search Elasticsearch configuration
+      ansible.builtin.shell: |
+        grep -RniE \
+          'elasticsearch|cacert|ssl_certificate|ssl_key|ssl_enabled|verification_mode' \
+          "{{ logstash_config_dir }}" 2>/dev/null
+      register: logstash_es_config
+      changed_when: false
+      failed_when: false
+
+
+    - name: Report Logstash configuration
+      ansible.builtin.debug:
+        msg:
+          - "CONFIGURATION"
+          - "----------------------------------------------------------------"
+          - "{{ logstash_es_config.stdout }}"
+          - ""
+
+
+    # ========================================================
+    # SERVICE
+    # ========================================================
+
+    - name: Check Logstash service
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ logstash_service }}"
+      register: logstash_service_status
+      changed_when: false
+      failed_when: false
+
+
+    - name: Report service
+      ansible.builtin.debug:
+        msg:
+          - "IMPLEMENTATION"
+          - "----------------------------------------------------------------"
+          - >-
+            Logstash service:
+            {{ 'PASS' if logstash_service_status.rc == 0 else 'FAIL' }}
+          - ""
+
+
+    # ========================================================
+    # LIVE HTTPS
+    # ========================================================
+
+    - name: Test HTTPS from Logstash to Elasticsearch
+      ansible.builtin.shell: |
+        curl \
+          --silent \
+          --show-error \
+          --output /dev/null \
+          --write-out '%{http_code}' \
+          --connect-timeout 10 \
+          "https://{{ item }}:{{ es_http_port }}"
+      loop: "{{ es_hosts }}"
+      register: es_https_tests
+      changed_when: false
+      failed_when: false
+
+
+    - name: Report HTTPS
+      ansible.builtin.debug:
+        msg:
+          - "LIVE HTTPS"
+          - "----------------------------------------------------------------"
+          - >-
+            {{ inventory_hostname }} → {{ item.item }}:
+            {% if item.rc == 0 %}PASS - HTTP {{ item.stdout }}{% else %}FAIL{% endif %}
+      loop: "{{ es_https_tests.results }}"
+
+
+    # ========================================================
+    # SERVER CERTIFICATE
+    # ========================================================
+
+    - name: Inspect Elasticsearch certificate
+      ansible.builtin.shell: |
+        echo | timeout 10 openssl s_client \
+          -connect "{{ item }}:{{ es_http_port }}" \
+          -servername "{{ item }}" \
+          2>/dev/null |
+        openssl x509 \
+          -noout \
+          -subject \
+          -issuer \
+          -dates \
+          -fingerprint -sha256 \
+          -ext subjectAltName
+      loop: "{{ es_hosts }}"
+      register: es_certificate_info
+      changed_when: false
+      failed_when: false
+
+
+    - name: Report Elasticsearch certificates
+      ansible.builtin.debug:
+        msg:
+          - "ELASTICSEARCH SERVER CERTIFICATE"
+          - "----------------------------------------------------------------"
+          - "{{ item.item }}"
+          - "{{ item.stdout }}"
+      loop: "{{ es_certificate_info.results }}"
+
+
+    # ========================================================
+    # FINAL
+    # ========================================================
+
+    - name: Final result
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " RESULT FOR {{ inventory_hostname }}"
+          - "================================================================"
+          - >-
+            Logstash service:
+            {{ 'PASS' if logstash_service_status.rc == 0 else 'FAIL' }}
+          - "Configuration: see above"
+          - "HTTPS: see individual Elasticsearch results above"
+          - "================================================================"
