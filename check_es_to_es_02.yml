@@ -1,0 +1,375 @@
+---
+# ============================================================
+# ELASTICSEARCH <-> ELASTICSEARCH TLS DIAGNOSTIC
+#
+# Run:
+#   ansible-playbook -i inventory.ini check_es_to_es.yml
+#
+# READ ONLY
+# ============================================================
+
+- name: Elasticsearch transport TLS diagnostic
+  hosts: elasticsearch
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLES
+    # ========================================================
+
+    # Elasticsearch configuration file
+    es_config: "/etc/elasticsearch/elasticsearch.yml"
+
+    # Elasticsearch service
+    es_service: "elasticsearch"
+
+    # Elasticsearch transport port
+    es_transport_port: 9300
+
+    # Replace with your actual Elasticsearch hostnames
+    expected_es_nodes:
+      - "es01.example.com"
+      - "es02.example.com"
+      - "es03.example.com"
+
+    certificate_warning_days: 30
+
+    # ========================================================
+    # END USER VARIABLES
+    # ========================================================
+
+  tasks:
+
+    - name: Header
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " ELASTICSEARCH ↔ ELASTICSEARCH TLS DIAGNOSTIC"
+          - "================================================================"
+          - "Node: {{ inventory_hostname }}"
+          - ""
+
+    # ========================================================
+    # CONFIGURATION
+    # ========================================================
+
+    - name: Read elasticsearch.yml
+      ansible.builtin.slurp:
+        src: "{{ es_config }}"
+      register: es_config_raw
+
+    - name: Decode configuration
+      ansible.builtin.set_fact:
+        es_config_text: "{{ es_config_raw.content | b64decode }}"
+
+    - name: Determine whether transport TLS is enabled
+      ansible.builtin.set_fact:
+        transport_tls_enabled: >-
+          {{
+            es_config_text is regex(
+              '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.enabled:\\s*true\\s*$'
+            )
+          }}
+
+    - name: Determine transport verification mode
+      ansible.builtin.set_fact:
+        transport_verification_mode: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.verification_mode:\\s*["'']?([^"''\\s]+)'
+                )
+              | first
+            ) | default('NOT EXPLICITLY CONFIGURED', true)
+          }}
+
+    - name: Detect transport certificate configuration
+      ansible.builtin.set_fact:
+        transport_certificate: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.certificate:\\s*["'']?([^"''\\n]+)'
+                )
+              | first
+            ) | default('', true)
+          }}
+
+    - name: Detect transport private key configuration
+      ansible.builtin.set_fact:
+        transport_key: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.key:\\s*["'']?([^"''\\n]+)'
+                )
+              | first
+            ) | default('', true)
+          }}
+
+    - name: Detect transport CA configuration
+      ansible.builtin.set_fact:
+        transport_ca: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.certificate_authorities:\\s*\\n(?:\\s*-\\s*)?([^\\n]+)'
+                )
+              | first
+            ) | default('', true)
+          }}
+
+    - name: Detect transport keystore
+      ansible.builtin.set_fact:
+        transport_keystore: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.keystore\\.path:\\s*["'']?([^"''\\n]+)'
+                )
+              | first
+            ) | default('', true)
+          }}
+
+    - name: Detect transport truststore
+      ansible.builtin.set_fact:
+        transport_truststore: >-
+          {{
+            (
+              es_config_text
+              | regex_findall(
+                  '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.truststore\\.path:\\s*["'']?([^"''\\n]+)'
+                )
+              | first
+            ) | default('', true)
+          }}
+
+    - name: Report configuration
+      ansible.builtin.debug:
+        msg:
+          - "CONFIGURATION"
+          - "----------------------------------------------------------------"
+          - "Transport TLS enabled:       {{ 'PASS' if transport_tls_enabled else 'FAIL' }}"
+          - "Verification mode:           {{ transport_verification_mode }}"
+          - >-
+            Certificate:
+            {{ transport_certificate if transport_certificate else 'Not configured as PEM' }}
+          - >-
+            Private key:
+            {{ transport_key if transport_key else 'Not configured as PEM' }}
+          - >-
+            CA:
+            {{ transport_ca if transport_ca else 'Not configured as PEM' }}
+          - >-
+            Keystore:
+            {{ transport_keystore if transport_keystore else 'Not configured' }}
+          - >-
+            Truststore:
+            {{ transport_truststore if transport_truststore else 'Not configured' }}
+          - ""
+
+    # ========================================================
+    # SERVICE
+    # ========================================================
+
+    - name: Check Elasticsearch service
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ es_service }}"
+      register: es_service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check transport port
+      ansible.builtin.shell:
+        cmd: "ss -lnt | awk '$4 ~ /:{{ es_transport_port }}$/ {print}'"
+      register: transport_listener
+      changed_when: false
+      failed_when: false
+
+    - name: Report service
+      ansible.builtin.debug:
+        msg:
+          - "IMPLEMENTATION"
+          - "----------------------------------------------------------------"
+          - >-
+            Elasticsearch service:
+            {{ 'PASS' if es_service_status.rc == 0 else 'FAIL' }}
+          - >-
+            Port {{ es_transport_port }}:
+            {{ 'PASS - listening' if transport_listener.stdout else 'FAIL - not listening' }}
+          - ""
+
+    # ========================================================
+    # CERTIFICATE FILE DISCOVERY
+    # ========================================================
+
+    - name: Resolve certificate path
+      ansible.builtin.set_fact:
+        resolved_transport_certificate: >-
+          {{
+            transport_certificate
+            if transport_certificate.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ transport_certificate
+              if transport_certificate
+              else ''
+            )
+          }}
+
+    - name: Resolve CA path
+      ansible.builtin.set_fact:
+        resolved_transport_ca: >-
+          {{
+            transport_ca
+            if transport_ca.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ transport_ca
+              if transport_ca
+              else ''
+            )
+          }}
+
+    - name: Check PEM certificate
+      ansible.builtin.stat:
+        path: "{{ resolved_transport_certificate }}"
+      register: transport_cert_stat
+      when: resolved_transport_certificate | length > 0
+
+    - name: Check CA
+      ansible.builtin.stat:
+        path: "{{ resolved_transport_ca }}"
+      register: transport_ca_stat
+      when: resolved_transport_ca | length > 0
+
+    - name: Check PKCS#12 keystore
+      ansible.builtin.stat:
+        path: >-
+          {{
+            transport_keystore
+            if transport_keystore.startswith('/')
+            else '/etc/elasticsearch/' ~ transport_keystore
+          }}
+      register: transport_keystore_stat
+      when: transport_keystore | length > 0
+
+    # ========================================================
+    # CERTIFICATE DETAILS
+    # ========================================================
+
+    - name: Extract PEM certificate information
+      ansible.builtin.shell: |
+        openssl x509 \
+          -in "{{ resolved_transport_certificate }}" \
+          -noout \
+          -subject \
+          -issuer \
+          -serial \
+          -dates \
+          -fingerprint -sha256 \
+          -ext subjectAltName
+      register: pem_certificate_info
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_transport_certificate | length > 0
+        - transport_cert_stat.stat.exists | default(false)
+
+    - name: Report certificate
+      ansible.builtin.debug:
+        msg:
+          - "CERTIFICATE"
+          - "----------------------------------------------------------------"
+          - "{{ pem_certificate_info.stdout }}"
+      when:
+        - pem_certificate_info is defined
+        - pem_certificate_info.stdout is defined
+        - pem_certificate_info.stdout | length > 0
+
+    # ========================================================
+    # PKCS#12
+    # ========================================================
+
+    - name: Inspect PKCS#12 certificate store
+      ansible.builtin.command:
+        cmd: >-
+          openssl pkcs12
+          -in "{{ transport_keystore_stat.stat.path }}"
+          -info
+          -nokeys
+          -passin pass:
+      register: pkcs12_info
+      changed_when: false
+      failed_when: false
+      when:
+        - transport_keystore | length > 0
+        - transport_keystore_stat.stat.exists | default(false)
+
+    - name: Report PKCS#12 status
+      ansible.builtin.debug:
+        msg:
+          - "CERTIFICATE STORE"
+          - "----------------------------------------------------------------"
+          - >-
+            PKCS#12 file:
+            {{ 'PASS - exists' if transport_keystore_stat.stat.exists else 'FAIL' }}
+          - >-
+            Contents:
+            {{ pkcs12_info.stderr | default('Unable to inspect without keystore password') }}
+      when: transport_keystore | length > 0
+
+    # ========================================================
+    # LIVE TLS
+    # ========================================================
+
+    - name: Test TLS against every other ES node
+      ansible.builtin.shell: |
+        timeout 10 openssl s_client \
+          -connect "{{ item }}:{{ es_transport_port }}" \
+          -servername "{{ item }}" \
+          -verify_return_error \
+          </dev/null 2>&1
+      loop: "{{ expected_es_nodes }}"
+      when: item != inventory_hostname
+      register: node_tls_tests
+      changed_when: false
+      failed_when: false
+
+    - name: Report node-to-node TLS
+      ansible.builtin.debug:
+        msg:
+          - "LIVE TLS"
+          - "----------------------------------------------------------------"
+          - >-
+            {{ inventory_hostname }} → {{ item.item }}:
+            {{ 'PASS' if item.rc == 0 else 'FAIL' }}
+      loop: "{{ node_tls_tests.results }}"
+
+    # ========================================================
+    # FINAL
+    # ========================================================
+
+    - name: Final result
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " RESULT FOR {{ inventory_hostname }}"
+          - "================================================================"
+          - >-
+            Configuration:
+            {{ 'PASS' if transport_tls_enabled else 'FAIL' }}
+          - >-
+            Elasticsearch service:
+            {{ 'PASS' if es_service_status.rc == 0 else 'FAIL' }}
+          - >-
+            Transport port:
+            {{ 'PASS' if transport_listener.stdout else 'FAIL' }}
+          - "Live TLS: see individual node results above"
+          - "================================================================"
