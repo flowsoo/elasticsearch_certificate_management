@@ -1,0 +1,141 @@
+---
+# ============================================================
+# CHECK ELASTICSEARCH TRANSPORT TLS AUTHENTICATION CONFIG
+#
+# ONLY examines elasticsearch.yml
+#
+# It does NOT:
+#   - inspect certificate files
+#   - inspect keystores
+#   - test TLS
+#   - test connectivity
+#   - modify anything
+# ============================================================
+
+- name: Determine Elasticsearch transport TLS configuration
+  hosts: "es01,es02,es03"
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLE
+    # ========================================================
+
+    es_config: "/etc/elasticsearch/elasticsearch.yml"
+
+    # ========================================================
+    # END USER VARIABLE
+    # ========================================================
+
+  tasks:
+
+    - name: Read elasticsearch.yml
+      ansible.builtin.slurp:
+        src: "{{ es_config }}"
+      register: es_config_raw
+
+    - name: Decode configuration
+      ansible.builtin.set_fact:
+        es_config_text: "{{ es_config_raw.content | b64decode }}"
+
+    # --------------------------------------------------------
+    # Find every transport SSL setting that actually exists
+    # --------------------------------------------------------
+
+    - name: Extract transport TLS settings
+      ansible.builtin.set_fact:
+        transport_tls_settings: >-
+          {{
+            es_config_text
+            | regex_findall(
+                '(?m)^\\s*(xpack\\.security\\.transport\\.ssl\\.[^:#]+):\\s*(.*?)\\s*$'
+              )
+          }}
+
+    # --------------------------------------------------------
+    # Determine which authentication mechanism is configured
+    # --------------------------------------------------------
+
+    - name: Determine configured authentication mechanism
+      ansible.builtin.set_fact:
+        authentication_mechanism: >-
+          {{
+            'KEYSTORE/TRUSTSTORE'
+            if (
+              es_config_text is regex(
+                '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.keystore\\.path\\s*:'
+              )
+              or
+              es_config_text is regex(
+                '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.truststore\\.path\\s*:'
+              )
+            )
+            else
+            'CERTIFICATE + PRIVATE KEY'
+            if (
+              es_config_text is regex(
+                '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.certificate\\s*:'
+              )
+              or
+              es_config_text is regex(
+                '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.key\\s*:'
+              )
+            )
+            else
+            'NOT EXPLICITLY CONFIGURED'
+          }}
+
+    # --------------------------------------------------------
+    # Determine whether TLS is explicitly enabled
+    # --------------------------------------------------------
+
+    - name: Determine TLS state
+      ansible.builtin.set_fact:
+        transport_tls_state: >-
+          {{
+            'ENABLED'
+            if es_config_text is regex(
+              '(?m)^\\s*xpack\\.security\\.transport\\.ssl\\.enabled\\s*:\\s*true\\s*$'
+            )
+            else
+            'NOT EXPLICITLY ENABLED'
+          }}
+
+    # --------------------------------------------------------
+    # Report
+    # --------------------------------------------------------
+
+    - name: Display transport TLS configuration
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " ELASTICSEARCH TRANSPORT TLS CONFIGURATION"
+          - "================================================================"
+          - ""
+          - "Node:"
+          - "  {{ inventory_hostname }}"
+          - ""
+          - "Configuration:"
+          - "  {{ es_config }}"
+          - ""
+          - "TLS:"
+          - "  {{ transport_tls_state }}"
+          - ""
+          - "AUTHENTICATION / CERTIFICATE MECHANISM:"
+          - "  {{ authentication_mechanism }}"
+          - ""
+          - "CONFIGURED TRANSPORT TLS SETTINGS:"
+          - "----------------------------------------------------------------"
+          - >-
+            {{
+              transport_tls_settings
+              | map('join', ' = ')
+              | list
+              if transport_tls_settings | length > 0
+              else ['No xpack.security.transport.ssl.* settings found']
+            }}
+          - ""
+          - "================================================================"
