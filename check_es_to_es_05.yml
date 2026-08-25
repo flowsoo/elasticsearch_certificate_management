@@ -1,0 +1,612 @@
+---
+# ============================================================
+# ELASTICSEARCH ↔ ELASTICSEARCH
+# TRANSPORT TLS DIAGNOSTIC
+#
+# READ ONLY
+#
+# Run:
+#   ansible-playbook -i inventory.ini check_es_to_es.yml
+# ============================================================
+
+- name: Elasticsearch transport TLS diagnostic
+  hosts: "es01,es02,es03"
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ========================================================
+    # USER VARIABLES
+    # ========================================================
+
+    es_config: "/etc/elasticsearch/elasticsearch.yml"
+
+    es_service: "elasticsearch"
+
+    es_transport_port: 9300
+
+    es_node_1: "es01"
+    es_node_2: "es02"
+    es_node_3: "es03"
+
+    # ========================================================
+    # END USER VARIABLES
+    # ========================================================
+
+  tasks:
+
+    # ========================================================
+    # HEADER
+    # ========================================================
+
+    - name: Display header
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " ELASTICSEARCH ↔ ELASTICSEARCH"
+          - " TRANSPORT TLS DIAGNOSTIC"
+          - "================================================================"
+          - "Node: {{ inventory_hostname }}"
+          - "Configuration: {{ es_config }}"
+          - ""
+
+
+    # ========================================================
+    # READ AND PARSE elasticsearch.yml
+    # ========================================================
+
+    - name: Read elasticsearch.yml
+      ansible.builtin.slurp:
+        src: "{{ es_config }}"
+      register: es_config_raw
+
+
+    - name: Parse elasticsearch.yml
+      ansible.builtin.set_fact:
+        es_settings: >-
+          {{
+            es_config_raw.content
+            | b64decode
+            | from_yaml
+          }}
+
+
+    # ========================================================
+    # EXTRACT ALL TRANSPORT TLS SETTINGS
+    # ========================================================
+
+    - name: Extract transport TLS settings
+      ansible.builtin.set_fact:
+        transport_tls_settings: >-
+          {{
+            es_settings
+            | dict2items
+            | selectattr(
+                'key',
+                'match',
+                '^xpack\.security\.transport\.ssl\.'
+              )
+            | list
+          }}
+
+
+    # ========================================================
+    # EXTRACT SPECIFIC SETTINGS FROM PARSED YAML
+    # ========================================================
+
+    - name: Determine transport TLS configuration
+      ansible.builtin.set_fact:
+
+        transport_tls_enabled: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.enabled'
+            ] | default(false)
+          }}
+
+        verification_mode: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.verification_mode'
+            ] | default('DEFAULT')
+          }}
+
+        client_authentication: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.client_authentication'
+            ] | default('DEFAULT')
+          }}
+
+        certificate: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.certificate'
+            ] | default('')
+          }}
+
+        private_key: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.key'
+            ] | default('')
+          }}
+
+        certificate_authorities: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.certificate_authorities'
+            ] | default([])
+          }}
+
+        keystore_path: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.keystore.path'
+            ] | default('')
+          }}
+
+        keystore_type: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.keystore.type'
+            ] | default('')
+          }}
+
+        truststore_path: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.truststore.path'
+            ] | default('')
+          }}
+
+        truststore_type: >-
+          {{
+            es_settings[
+              'xpack.security.transport.ssl.truststore.type'
+            ] | default('')
+          }}
+
+
+    # ========================================================
+    # ESTABLISH WHAT IS ACTUALLY CONFIGURED
+    # ========================================================
+
+    - name: Determine certificate mechanism
+      ansible.builtin.set_fact:
+        certificate_mechanism: >-
+          {{
+            (
+              ['KEYSTORE']
+              if keystore_path | length > 0
+              else []
+            )
+            +
+            (
+              ['TRUSTSTORE']
+              if truststore_path | length > 0
+              else []
+            )
+            +
+            (
+              ['CERTIFICATE']
+              if certificate | length > 0
+              else []
+            )
+            +
+            (
+              ['PRIVATE KEY']
+              if private_key | length > 0
+              else []
+            )
+            +
+            (
+              ['CERTIFICATE AUTHORITIES']
+              if certificate_authorities | length > 0
+              else []
+            )
+          }}
+
+
+    # ========================================================
+    # DISPLAY CONFIGURATION
+    # ========================================================
+
+    - name: Display transport TLS configuration
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " CONFIGURATION FROM elasticsearch.yml"
+          - "================================================================"
+          - ""
+          - "Transport TLS enabled:"
+          - "  {{ transport_tls_enabled }}"
+          - ""
+          - "Verification mode:"
+          - "  {{ verification_mode }}"
+          - ""
+          - "Client authentication:"
+          - "  {{ client_authentication }}"
+          - ""
+          - "Certificate mechanism actually configured:"
+          - "  {{ certificate_mechanism | join(' + ') if certificate_mechanism | length > 0 else 'NONE FOUND' }}"
+          - ""
+          - "Certificate:"
+          - "  {{ certificate if certificate else 'NOT CONFIGURED' }}"
+          - ""
+          - "Private key:"
+          - "  {{ private_key if private_key else 'NOT CONFIGURED' }}"
+          - ""
+          - "Certificate authorities:"
+          - "  {{ certificate_authorities if certificate_authorities | length > 0 else 'NOT CONFIGURED' }}"
+          - ""
+          - "Keystore:"
+          - "  Path: {{ keystore_path if keystore_path else 'NOT CONFIGURED' }}"
+          - "  Type: {{ keystore_type if keystore_type else 'DEFAULT / NOT CONFIGURED' }}"
+          - ""
+          - "Truststore:"
+          - "  Path: {{ truststore_path if truststore_path else 'NOT CONFIGURED' }}"
+          - "  Type: {{ truststore_type if truststore_type else 'DEFAULT / NOT CONFIGURED' }}"
+          - ""
+
+
+    # ========================================================
+    # RESOLVE ELASTICSEARCH RELATIVE PATHS
+    # ========================================================
+
+    - name: Resolve certificate path
+      ansible.builtin.set_fact:
+        resolved_certificate: >-
+          {{
+            certificate
+            if certificate.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ certificate
+              if certificate
+              else ''
+            )
+          }}
+
+
+    - name: Resolve private key path
+      ansible.builtin.set_fact:
+        resolved_private_key: >-
+          {{
+            private_key
+            if private_key.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ private_key
+              if private_key
+              else ''
+            )
+          }}
+
+
+    - name: Resolve keystore path
+      ansible.builtin.set_fact:
+        resolved_keystore: >-
+          {{
+            keystore_path
+            if keystore_path.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ keystore_path
+              if keystore_path
+              else ''
+            )
+          }}
+
+
+    - name: Resolve truststore path
+      ansible.builtin.set_fact:
+        resolved_truststore: >-
+          {{
+            truststore_path
+            if truststore_path.startswith('/')
+            else (
+              '/etc/elasticsearch/' ~ truststore_path
+              if truststore_path
+              else ''
+            )
+          }}
+
+
+    # ========================================================
+    # CHECK CONFIGURED FILES
+    # ========================================================
+
+    - name: Check configured certificate
+      ansible.builtin.stat:
+        path: "{{ resolved_certificate }}"
+      register: certificate_stat
+      when: resolved_certificate | length > 0
+
+
+    - name: Check configured private key
+      ansible.builtin.stat:
+        path: "{{ resolved_private_key }}"
+      register: private_key_stat
+      when: resolved_private_key | length > 0
+
+
+    - name: Check configured keystore
+      ansible.builtin.stat:
+        path: "{{ resolved_keystore }}"
+      register: keystore_stat
+      when: resolved_keystore | length > 0
+
+
+    - name: Check configured truststore
+      ansible.builtin.stat:
+        path: "{{ resolved_truststore }}"
+      register: truststore_stat
+      when: resolved_truststore | length > 0
+
+
+    # ========================================================
+    # FILE VALIDATION
+    # ========================================================
+
+    - name: Display configured file validation
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " CONFIGURED FILES"
+          - "================================================================"
+          - ""
+          - >-
+            Certificate:
+            {{
+              'PASS - exists'
+              if certificate_stat.stat.exists | default(false)
+              else (
+                'FAIL - file does not exist'
+                if certificate
+                else 'NOT CONFIGURED'
+              )
+            }}
+          - >-
+            Private key:
+            {{
+              'PASS - exists'
+              if private_key_stat.stat.exists | default(false)
+              else (
+                'FAIL - file does not exist'
+                if private_key
+                else 'NOT CONFIGURED'
+              )
+            }}
+          - >-
+            Keystore:
+            {{
+              'PASS - exists'
+              if keystore_stat.stat.exists | default(false)
+              else (
+                'FAIL - file does not exist'
+                if keystore_path
+                else 'NOT CONFIGURED'
+              )
+            }}
+          - >-
+            Truststore:
+            {{
+              'PASS - exists'
+              if truststore_stat.stat.exists | default(false)
+              else (
+                'FAIL - file does not exist'
+                if truststore_path
+                else 'NOT CONFIGURED'
+              )
+            }}
+          - ""
+
+
+    # ========================================================
+    # IDENTIFY ACTUAL FILE TYPES
+    #
+    # This does NOT assume a certificate format.
+    # ========================================================
+
+    - name: Identify configured certificate file
+      ansible.builtin.command:
+        cmd: "file {{ resolved_certificate }}"
+      register: certificate_file_type
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_certificate | length > 0
+        - certificate_stat.stat.exists | default(false)
+
+
+    - name: Identify configured keystore file
+      ansible.builtin.command:
+        cmd: "file {{ resolved_keystore }}"
+      register: keystore_file_type
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_keystore | length > 0
+        - keystore_stat.stat.exists | default(false)
+
+
+    - name: Identify configured truststore file
+      ansible.builtin.command:
+        cmd: "file {{ resolved_truststore }}"
+      register: truststore_file_type
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_truststore | length > 0
+        - truststore_stat.stat.exists | default(false)
+
+
+    - name: Display actual file types
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " ACTUAL FILE TYPES"
+          - "================================================================"
+          - ""
+          - >-
+            Certificate:
+            {{ certificate_file_type.stdout | default('NOT APPLICABLE') }}
+          - >-
+            Keystore:
+            {{ keystore_file_type.stdout | default('NOT APPLICABLE') }}
+          - >-
+            Truststore:
+            {{ truststore_file_type.stdout | default('NOT APPLICABLE') }}
+          - ""
+
+
+    # ========================================================
+    # CERTIFICATE INSPECTION
+    #
+    # Only inspect a certificate if Elasticsearch actually
+    # configured a certificate path.
+    #
+    # We do NOT assume the format beforehand.
+    # ========================================================
+
+    - name: Inspect configured certificate
+      ansible.builtin.command:
+        cmd: >-
+          openssl x509
+          -in "{{ resolved_certificate }}"
+          -noout
+          -subject
+          -issuer
+          -serial
+          -dates
+          -fingerprint -sha256
+          -ext subjectAltName
+      register: certificate_details
+      changed_when: false
+      failed_when: false
+      when:
+        - resolved_certificate | length > 0
+        - certificate_stat.stat.exists | default(false)
+
+
+    - name: Display certificate details
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " CERTIFICATE DETAILS"
+          - "================================================================"
+          - ""
+          - "{{ certificate_details.stdout | default('Certificate inspection not applicable.') }}"
+          - ""
+      when:
+        - certificate_details is defined
+        - certificate_details.stdout | default('') | length > 0
+
+
+    # ========================================================
+    # ELASTICSEARCH SERVICE
+    # ========================================================
+
+    - name: Check Elasticsearch service
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ es_service }}"
+      register: es_service_status
+      changed_when: false
+      failed_when: false
+
+
+    # ========================================================
+    # TRANSPORT LISTENER
+    # ========================================================
+
+    - name: Check Elasticsearch transport listener
+      ansible.builtin.shell:
+        cmd: "ss -lnt | awk '$4 ~ /:{{ es_transport_port }}$/ {print}'"
+      register: transport_listener
+      changed_when: false
+      failed_when: false
+
+
+    # ========================================================
+    # LIVE TLS CONNECTION TEST
+    # ========================================================
+
+    - name: Test transport TLS against other Elasticsearch nodes
+      ansible.builtin.shell: |
+        timeout 10 openssl s_client \
+          -connect "{{ item }}:{{ es_transport_port }}" \
+          -servername "{{ item }}" \
+          -showcerts \
+          </dev/null 2>&1
+      loop:
+        - "{{ es_node_1 }}"
+        - "{{ es_node_2 }}"
+        - "{{ es_node_3 }}"
+      when: item != inventory_hostname
+      register: transport_tls_tests
+      changed_when: false
+      failed_when: false
+
+
+    - name: Display live TLS results
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - " LIVE TRANSPORT TLS"
+          - "================================================================"
+          - ""
+          - >-
+            {{ inventory_hostname }} → {{ item.item }}:
+            {{
+              'PASS - TLS handshake completed'
+              if item.rc == 0
+              else 'FAIL - TLS handshake failed'
+            }}
+      loop: "{{ transport_tls_tests.results }}"
+
+
+    # ========================================================
+    # FINAL SUMMARY
+    # ========================================================
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " FINAL SUMMARY - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - >-
+            Transport TLS:
+            {{
+              'PASS'
+              if transport_tls_enabled | bool
+              else 'NOT ENABLED'
+            }}
+          - "Certificate mechanism:"
+          - >-
+            {{
+              certificate_mechanism | join(' + ')
+              if certificate_mechanism | length > 0
+              else 'NONE EXPLICITLY CONFIGURED'
+            }}
+          - >-
+            Verification mode:
+            {{ verification_mode }}
+          - >-
+            Client authentication:
+            {{ client_authentication }}
+          - >-
+            Elasticsearch service:
+            {{ 'PASS' if es_service_status.rc == 0 else 'FAIL' }}
+          - >-
+            Transport listener:
+            {{
+              'PASS'
+              if transport_listener.stdout
+              else 'FAIL'
+            }}
+          - ""
+          - "================================================================"
