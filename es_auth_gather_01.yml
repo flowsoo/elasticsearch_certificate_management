@@ -1,0 +1,1309 @@
+---
+# =====================================================================
+# ELASTIC STACK CONNECTION / TLS INFORMATION GATHERER
+#
+# READ ONLY
+#
+# PURPOSE
+# -------
+# Gather ALL locally available information required to assess:
+#
+#   1. Elasticsearch <-> Elasticsearch transport connections
+#   2. Kibana -> Elasticsearch HTTP connections
+#   3. Logstash -> Elasticsearch HTTP connections
+#   4. Logstash <-> Logstash connections where configured
+#   5. HTTP and transport TLS certificate/trust configuration
+#   6. Network bind/publish/listener configuration
+#   7. Host addressing, routing and firewall information
+#
+# THIS PLAYBOOK DOES NOT PERFORM CONNECTION TESTS.
+#
+# It does NOT use:
+#   - curl
+#   - openssl s_client
+#   - nc / netcat
+#   - telnet
+#   - ping
+#   - TCP/UDP probes
+#
+# It DOES inspect local configuration and local state.
+#
+#
+# REQUIREMENTS / PLACEHOLDERS
+# ---------------------------
+#
+# Change these variables before running.
+#
+#   es_group:
+#       Ansible inventory group containing Elasticsearch nodes.
+#
+#   kibana_group:
+#       Ansible inventory group containing Kibana nodes.
+#
+#   logstash_group:
+#       Ansible inventory group containing Logstash nodes.
+#
+#   es_config:
+#       Elasticsearch configuration file.
+#
+#   kibana_config:
+#       Kibana configuration file.
+#
+#   logstash_config:
+#       Logstash main configuration file.
+#
+#   es_http_port:
+#       Expected Elasticsearch HTTP port.
+#
+#   es_transport_port:
+#       Expected Elasticsearch transport port.
+#
+#   kibana_port:
+#       Expected Kibana web port.
+#
+#   logstash_ports:
+#       Ports on which Logstash network inputs are expected.
+#
+#
+# INVENTORY EXAMPLE
+# -----------------
+#
+# [elasticsearch]
+# es01
+# es02
+# es03
+#
+# [kibana]
+# kibana01
+#
+# [logstash]
+# logstash01
+#
+#
+# RUN
+# ---
+#
+# ansible-playbook -i inventory.ini gather_elastic_connections.yml
+#
+# Optional:
+#
+# ansible-playbook -i inventory.ini gather_elastic_connections.yml \
+#   -e es_group=elasticsearch \
+#   -e kibana_group=kibana \
+#   -e logstash_group=logstash
+#
+# =====================================================================
+
+- name: Gather Elasticsearch / Kibana / Logstash connection information
+  hosts: "all"
+  become: true
+  gather_facts: false
+
+  vars:
+
+    # ================================================================
+    # USER VARIABLES - CHANGE THESE
+    # ================================================================
+
+    es_group: "elasticsearch"
+
+    kibana_group: "kibana"
+
+    logstash_group: "logstash"
+
+
+    # ------------------------------------------------
+    # Elasticsearch
+    # ------------------------------------------------
+
+    es_config: "/etc/elasticsearch/elasticsearch.yml"
+
+    es_service: "elasticsearch"
+
+    es_http_port: 9200
+
+    es_transport_port: 9300
+
+
+    # ------------------------------------------------
+    # Kibana
+    # ------------------------------------------------
+
+    kibana_config: "/etc/kibana/kibana.yml"
+
+    kibana_service: "kibana"
+
+    kibana_port: 5601
+
+
+    # ------------------------------------------------
+    # Logstash
+    # ------------------------------------------------
+
+    logstash_config: "/etc/logstash/logstash.yml"
+
+    logstash_service: "logstash"
+
+    # Add expected Logstash network ports here.
+    #
+    # Example:
+    #
+    # logstash_ports:
+    #   - 5044
+    #   - 5000
+    #
+    logstash_ports:
+      - 5044
+
+
+    # ------------------------------------------------
+    # Logstash pipeline locations
+    # ------------------------------------------------
+
+    logstash_pipeline_dir: "/etc/logstash/conf.d"
+
+
+    # ------------------------------------------------
+    # Other useful locations
+    # ------------------------------------------------
+
+    elasticsearch_keystore: "/etc/elasticsearch/elasticsearch.keystore"
+
+    kibana_keystore: "/etc/kibana/kibana.keystore"
+
+    logstash_keystore: "/etc/logstash/logstash.keystore"
+
+
+    # ================================================================
+    # END USER VARIABLES
+    # ================================================================
+
+
+  tasks:
+
+    # ================================================================
+    # HOST IDENTIFICATION
+    # ================================================================
+
+    - name: Display host header
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " ELASTIC STACK CONNECTION INFORMATION GATHERER"
+          - "================================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Groups: {{ group_names | join(', ') }}"
+          - "================================================================"
+          - ""
+
+
+    - name: Determine host roles
+      ansible.builtin.set_fact:
+        is_elasticsearch_host: "{{ inventory_hostname in groups[es_group] | default([]) }}"
+        is_kibana_host: "{{ inventory_hostname in groups[kibana_group] | default([]) }}"
+        is_logstash_host: "{{ inventory_hostname in groups[logstash_group] | default([]) }}"
+
+
+    # ================================================================
+    # BASIC OPERATING SYSTEM / NETWORK INFORMATION
+    #
+    # These are not connection tests.
+    # ================================================================
+
+    - name: Gather hostname information
+      ansible.builtin.command:
+        cmd: hostnamectl
+      register: hostnamectl_output
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather hostname and FQDN
+      ansible.builtin.shell:
+        cmd: |
+          printf 'hostname: '
+          hostname
+          printf 'fqdn: '
+          hostname -f 2>/dev/null || true
+          printf 'hostname -A: '
+          hostname -A 2>/dev/null || true
+      register: hostname_output
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather IP addresses
+      ansible.builtin.command:
+        cmd: ip -br addr
+      register: ip_addresses
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather routing table
+      ansible.builtin.command:
+        cmd: ip route
+      register: ip_routes
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather IPv6 routing table
+      ansible.builtin.command:
+        cmd: ip -6 route
+      register: ipv6_routes
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather DNS resolver configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- /etc/resolv.conf -----"
+          cat /etc/resolv.conf 2>/dev/null || true
+
+          echo
+          echo "----- resolvectl status -----"
+          resolvectl status 2>/dev/null || true
+
+          echo
+          echo "----- systemd-resolve --status -----"
+          systemd-resolve --status 2>/dev/null || true
+      register: dns_configuration
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather local listening sockets
+      ansible.builtin.command:
+        cmd: ss -lntup
+      register: listening_sockets
+      changed_when: false
+      failed_when: false
+
+
+    # ================================================================
+    # FIREWALL INFORMATION
+    #
+    # Only inspect local firewall configuration.
+    # No traffic is generated.
+    # ================================================================
+
+    - name: Gather nftables rules
+      ansible.builtin.shell:
+        cmd: nft list ruleset 2>/dev/null || true
+      register: nftables_rules
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather iptables rules
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- iptables -----"
+          iptables -S 2>/dev/null || true
+
+          echo
+          echo "----- ip6tables -----"
+          ip6tables -S 2>/dev/null || true
+      register: iptables_rules
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather firewalld configuration
+      ansible.builtin.shell:
+        cmd: |
+          firewall-cmd --state 2>/dev/null || true
+          firewall-cmd --get-active-zones 2>/dev/null || true
+          firewall-cmd --list-all-zones 2>/dev/null || true
+      register: firewalld_rules
+      changed_when: false
+      failed_when: false
+
+
+    # ================================================================
+    # PACKAGE / SERVICE VERSION INFORMATION
+    # ================================================================
+
+    - name: Gather Elasticsearch version
+      ansible.builtin.shell:
+        cmd: |
+          if command -v elasticsearch >/dev/null 2>&1; then
+            elasticsearch --version 2>&1 || true
+          fi
+
+          if [ -x /usr/share/elasticsearch/bin/elasticsearch ]; then
+            /usr/share/elasticsearch/bin/elasticsearch --version 2>&1 || true
+          fi
+      register: elasticsearch_version
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather Kibana version
+      ansible.builtin.shell:
+        cmd: |
+          if command -v kibana >/dev/null 2>&1; then
+            kibana --version 2>&1 || true
+          fi
+
+          if [ -x /usr/share/kibana/bin/kibana ]; then
+            /usr/share/kibana/bin/kibana --version 2>&1 || true
+          fi
+      register: kibana_version
+      changed_when: false
+      failed_when: false
+
+
+    - name: Gather Logstash version
+      ansible.builtin.shell:
+        cmd: |
+          if command -v logstash >/dev/null 2>&1; then
+            logstash --version 2>&1 || true
+          fi
+
+          if [ -x /usr/share/logstash/bin/logstash ]; then
+            /usr/share/logstash/bin/logstash --version 2>&1 || true
+          fi
+      register: logstash_version
+      changed_when: false
+      failed_when: false
+
+
+    # ================================================================
+    # SYSTEMD SERVICE INFORMATION
+    #
+    # Important because systemd overrides can change:
+    #   - configuration locations
+    #   - JVM options
+    #   - environment
+    #   - network bindings
+    #   - paths
+    # ================================================================
+
+    - name: Gather Elasticsearch systemd information
+      ansible.builtin.shell:
+        cmd: |
+          systemctl status {{ es_service }} --no-pager 2>&1 || true
+          echo
+          systemctl cat {{ es_service }} 2>&1 || true
+          echo
+          systemctl show {{ es_service }} \
+            -p FragmentPath \
+            -p DropInPaths \
+            -p ExecStart \
+            -p Environment \
+            -p EnvironmentFiles \
+            -p User \
+            -p Group \
+            -p WorkingDirectory \
+            2>&1 || true
+      register: es_systemd
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Gather Kibana systemd information
+      ansible.builtin.shell:
+        cmd: |
+          systemctl status {{ kibana_service }} --no-pager 2>&1 || true
+          echo
+          systemctl cat {{ kibana_service }} 2>&1 || true
+          echo
+          systemctl show {{ kibana_service }} \
+            -p FragmentPath \
+            -p DropInPaths \
+            -p ExecStart \
+            -p Environment \
+            -p EnvironmentFiles \
+            -p User \
+            -p Group \
+            -p WorkingDirectory \
+            2>&1 || true
+      register: kibana_systemd
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    - name: Gather Logstash systemd information
+      ansible.builtin.shell:
+        cmd: |
+          systemctl status {{ logstash_service }} --no-pager 2>&1 || true
+          echo
+          systemctl cat {{ logstash_service }} 2>&1 || true
+          echo
+          systemctl show {{ logstash_service }} \
+            -p FragmentPath \
+            -p DropInPaths \
+            -p ExecStart \
+            -p Environment \
+            -p EnvironmentFiles \
+            -p User \
+            -p Group \
+            -p WorkingDirectory \
+            2>&1 || true
+      register: logstash_systemd
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # ELASTICSEARCH
+    # ================================================================
+
+    - name: Read Elasticsearch configuration
+      ansible.builtin.slurp:
+        src: "{{ es_config }}"
+      register: es_config_raw
+      when:
+        - is_elasticsearch_host
+        - es_config is file
+
+
+    - name: Display Elasticsearch configuration relevant to networking and TLS
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- Elasticsearch networking / discovery / HTTP / transport / security -----"
+
+          grep -nE \
+            '^[[:space:]]*(network\.|http\.|transport\.|discovery\.|cluster\.initial_master_nodes|xpack\.security\.enabled|xpack\.security\.authc\.|xpack\.security\.http\.ssl\.|xpack\.security\.transport\.ssl\.|xpack\.security\.remote_cluster\.|remote_cluster\.)' \
+            "{{ es_config }}" \
+            2>/dev/null || true
+
+          echo
+          echo "----- Elasticsearch YAML file permissions -----"
+          stat "{{ es_config }}" 2>/dev/null || true
+      register: es_network_tls_config
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Display all Elasticsearch xpack/security TLS settings
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- xpack.security.* -----"
+
+          grep -nEi \
+            '^[[:space:]]*xpack\.security\.' \
+            "{{ es_config }}" \
+            2>/dev/null || true
+      register: es_security_config
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Display Elasticsearch cluster/discovery configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- cluster / discovery -----"
+
+          grep -nEi \
+            '^[[:space:]]*(cluster\.|discovery\.)' \
+            "{{ es_config }}" \
+            2>/dev/null || true
+      register: es_cluster_config
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    # ================================================================
+    # ELASTICSEARCH KEYSTORE
+    #
+    # Only names are displayed.
+    #
+    # Secure values/passwords are NEVER displayed.
+    # ================================================================
+
+    - name: Gather Elasticsearch keystore setting names
+      ansible.builtin.shell:
+        cmd: |
+          if [ -x /usr/share/elasticsearch/bin/elasticsearch-keystore ]; then
+            /usr/share/elasticsearch/bin/elasticsearch-keystore list 2>&1 || true
+          elif [ -x /usr/bin/elasticsearch-keystore ]; then
+            /usr/bin/elasticsearch-keystore list 2>&1 || true
+          else
+            echo "elasticsearch-keystore executable not found"
+          fi
+      register: es_keystore_names
+      changed_when: false
+      failed_when: false
+      when:
+        - is_elasticsearch_host
+        - es_keystore is exists
+
+
+    # ================================================================
+    # ELASTICSEARCH CONFIGURATION FILE REFERENCES
+    #
+    # Find TLS material and relevant files without reading private keys.
+    # ================================================================
+
+    - name: Find Elasticsearch TLS related files
+      ansible.builtin.shell:
+        cmd: |
+          find /etc/elasticsearch \
+            -type f \
+            \( \
+              -iname '*.pem' \
+              -o -iname '*.crt' \
+              -o -iname '*.cer' \
+              -o -iname '*.key' \
+              -o -iname '*.p12' \
+              -o -iname '*.pfx' \
+              -o -iname '*.jks' \
+              -o -iname '*.truststore' \
+              -o -iname '*.keystore' \
+            \) \
+            -printf '%p\t%u:%g\t%M\t%s bytes\n' \
+            2>/dev/null || true
+      register: es_tls_files
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    # ================================================================
+    # ELASTICSEARCH HTTP CERTIFICATE
+    #
+    # Discover configured PEM certificate paths and inspect their
+    # public certificate metadata.
+    #
+    # PRIVATE KEY CONTENT IS NEVER DISPLAYED.
+    # ================================================================
+
+    - name: Find Elasticsearch configured certificate files
+      ansible.builtin.shell:
+        cmd: |
+          grep -E \
+            '^[[:space:]]*xpack\.security\.(http|transport)\.ssl\.(certificate|certificate_authorities|key)[[:space:]]*:' \
+            "{{ es_config }}" \
+            2>/dev/null || true
+      register: es_certificate_references
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Find PEM certificates under Elasticsearch configuration directory
+      ansible.builtin.shell:
+        cmd: |
+          find /etc/elasticsearch \
+            -type f \
+            \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \) \
+            -print \
+            2>/dev/null || true
+      register: es_certificate_files
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Inspect Elasticsearch certificates
+      ansible.builtin.shell:
+        cmd: |
+          for cert in \
+            $(find /etc/elasticsearch \
+              -type f \
+              \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \) \
+              2>/dev/null); do
+
+            echo
+            echo "================================================================"
+            echo "CERTIFICATE: ${cert}"
+            echo "================================================================"
+
+            openssl x509 \
+              -in "${cert}" \
+              -noout \
+              -subject \
+              -issuer \
+              -serial \
+              -dates \
+              -fingerprint -sha256 \
+              -ext subjectAltName \
+              -ext extendedKeyUsage \
+              -ext keyUsage \
+              2>&1 || true
+          done
+      register: es_certificate_details
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    # ================================================================
+    # ELASTICSEARCH LISTENERS
+    # ================================================================
+
+    - name: Inspect Elasticsearch HTTP listener
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- HTTP port {{ es_http_port }} -----"
+          ss -lntup | awk '$5 ~ /:'{{ es_http_port }}'$/ {print}' || true
+
+          echo
+          echo "----- HTTP port {{ es_http_port }} - all matching sockets -----"
+          ss -lntup | grep -E '[:.]{{ es_http_port }}([[:space:]]|$)' || true
+      register: es_http_listener
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Inspect Elasticsearch transport listener
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- transport port {{ es_transport_port }} -----"
+          ss -lntup | awk '$5 ~ /:'{{ es_transport_port }}'$/ {print}' || true
+
+          echo
+          echo "----- transport port {{ es_transport_port }} - all matching sockets -----"
+          ss -lntup | grep -E '[:.]{{ es_transport_port }}([[:space:]]|$)' || true
+      register: es_transport_listener
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    # ================================================================
+    # KIBANA
+    # ================================================================
+
+    - name: Read Kibana configuration
+      ansible.builtin.slurp:
+        src: "{{ kibana_config }}"
+      register: kibana_config_raw
+      when:
+        - is_kibana_host
+        - kibana_config is file
+
+
+    - name: Display Kibana Elasticsearch connection configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- Kibana -> Elasticsearch configuration -----"
+
+          grep -nEi \
+            '^[[:space:]]*(elasticsearch\.|monitoring\.ui\.elasticsearch\.)' \
+            "{{ kibana_config }}" \
+            2>/dev/null \
+            | sed -E \
+              's/(password|passphrase|token|apiKey|api_key|secret)[[:space:]]*:[[:space:]].*/\1: <REDACTED>/Ig' \
+            || true
+      register: kibana_es_config
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    - name: Display Kibana server configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- Kibana server/network configuration -----"
+
+          grep -nEi \
+            '^[[:space:]]*(server\.|server\.ssl\.|server\.host|server\.port|server\.publicBaseUrl)' \
+            "{{ kibana_config }}" \
+            2>/dev/null \
+            | sed -E \
+              's/(password|passphrase|token|apiKey|api_key|secret)[[:space:]]*:[[:space:]].*/\1: <REDACTED>/Ig' \
+            || true
+      register: kibana_server_config
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    - name: Display Kibana authentication configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- Kibana authentication-related configuration -----"
+
+          grep -nEi \
+            '^[[:space:]]*(elasticsearch\.serviceAccountToken|elasticsearch\.username|elasticsearch\.password|elasticsearch\.apiKey|elasticsearch\.ssl\.|elasticsearch\.hosts|monitoring\.ui\.elasticsearch\.)' \
+            "{{ kibana_config }}" \
+            2>/dev/null \
+            | sed -E \
+              's/(password|passphrase|token|apiKey|api_key|secret)[[:space:]]*:[[:space:]].*/\1: <REDACTED>/Ig' \
+            || true
+      register: kibana_auth_config
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    # ================================================================
+    # KIBANA KEYSTORE
+    #
+    # Again: names only, never secure values.
+    # ================================================================
+
+    - name: Gather Kibana keystore setting names
+      ansible.builtin.shell:
+        cmd: |
+          if [ -x /usr/share/kibana/bin/kibana-keystore ]; then
+            /usr/share/kibana/bin/kibana-keystore list 2>&1 || true
+          elif [ -x /usr/bin/kibana-keystore ]; then
+            /usr/bin/kibana-keystore list 2>&1 || true
+          else
+            echo "kibana-keystore executable not found"
+          fi
+      register: kibana_keystore_names
+      changed_when: false
+      failed_when: false
+      when:
+        - is_kibana_host
+        - kibana_keystore is exists
+
+
+    # ================================================================
+    # KIBANA TLS FILES
+    # ================================================================
+
+    - name: Find Kibana TLS related files
+      ansible.builtin.shell:
+        cmd: |
+          find /etc/kibana \
+            -type f \
+            \( \
+              -iname '*.pem' \
+              -o -iname '*.crt' \
+              -o -iname '*.cer' \
+              -o -iname '*.key' \
+              -o -iname '*.p12' \
+              -o -iname '*.pfx' \
+              -o -iname '*.jks' \
+            \) \
+            -printf '%p\t%u:%g\t%M\t%s bytes\n' \
+            2>/dev/null || true
+      register: kibana_tls_files
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    - name: Inspect Kibana PEM certificates
+      ansible.builtin.shell:
+        cmd: |
+          for cert in \
+            $(find /etc/kibana \
+              -type f \
+              \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \) \
+              2>/dev/null); do
+
+            echo
+            echo "================================================================"
+            echo "CERTIFICATE: ${cert}"
+            echo "================================================================"
+
+            openssl x509 \
+              -in "${cert}" \
+              -noout \
+              -subject \
+              -issuer \
+              -serial \
+              -dates \
+              -fingerprint -sha256 \
+              -ext subjectAltName \
+              -ext extendedKeyUsage \
+              -ext keyUsage \
+              2>&1 || true
+          done
+      register: kibana_certificate_details
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    - name: Inspect Kibana listener
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- Kibana port {{ kibana_port }} -----"
+          ss -lntup | grep -E '[:.]{{ kibana_port }}([[:space:]]|$)' || true
+      register: kibana_listener
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    # ================================================================
+    # LOGSTASH
+    # ================================================================
+
+    - name: Read Logstash main configuration
+      ansible.builtin.slurp:
+        src: "{{ logstash_config }}"
+      register: logstash_config_raw
+      when:
+        - is_logstash_host
+        - logstash_config is file
+
+
+    - name: Display Logstash main configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- /etc/logstash/logstash.yml -----"
+
+          sed -E \
+            -e 's/((password|passphrase|token|api[_-]?key|secret)[[:space:]]*=>?[[:space:]]*).*/\1<REDACTED>/Ig' \
+            -e 's/(://?[[:space:]]*).*/\1<REDACTED>/Ig' \
+            "{{ logstash_config }}" \
+            2>/dev/null || true
+      register: logstash_main_config
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # LOGSTASH PIPELINE FILES
+    #
+    # This is critical. The actual Elasticsearch output configuration
+    # normally lives here rather than in logstash.yml.
+    #
+    # Secrets are redacted.
+    # ================================================================
+
+    - name: Find Logstash pipeline configuration files
+      ansible.builtin.find:
+        paths: "{{ logstash_pipeline_dir }}"
+        recurse: true
+        file_type: file
+        patterns:
+          - "*.conf"
+          - "*.cfg"
+          - "*.pipeline"
+      register: logstash_pipeline_files
+      when: is_logstash_host
+
+
+    - name: Display Logstash pipeline configuration
+      ansible.builtin.shell:
+        cmd: |
+          for f in "{{ logstash_pipeline_dir }}"/*.conf; do
+
+            [ -f "$f" ] || continue
+
+            echo
+            echo "================================================================"
+            echo "LOGSTASH PIPELINE: $f"
+            echo "================================================================"
+
+            sed -E \
+              -e 's/((password|passphrase|token|api[_-]?key|secret)[[:space:]]*=>[[:space:]]*).*/\1<REDACTED>/Ig' \
+              -e 's/(["'\''](password|passphrase|token|api[_-]?key|secret)["'\''][[:space:]]*=>[[:space:]]*).*/\1<REDACTED>/Ig' \
+              "$f"
+
+          done
+      register: logstash_pipeline_config
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # LOGSTASH TLS / ELASTICSEARCH-SPECIFIC SETTINGS
+    # ================================================================
+
+    - name: Extract Logstash Elasticsearch and TLS configuration
+      ansible.builtin.shell:
+        cmd: |
+          echo "================================================================"
+          echo "LOGSTASH ELASTICSEARCH / TLS SETTINGS"
+          echo "================================================================"
+
+          grep -RniE \
+            '(^|[[:space:]])(hosts|cloud_id|cloud_auth|user|password|api_key|ssl_|ca_trusted_fingerprint|ssl_enabled|ssl_verification_mode|ssl_certificate_authorities|ssl_certificate|ssl_key|ssl_keystore|ssl_truststore|ssl_supported_protocols|ssl_cipher_suites|ssl_client_authentication)' \
+            "{{ logstash_pipeline_dir }}" \
+            /etc/logstash \
+            2>/dev/null \
+            | sed -E \
+              's/((password|passphrase|token|api[_-]?key|secret)[[:space:]]*=>?[[:space:]]*).*/\1<REDACTED>/Ig' \
+            || true
+      register: logstash_tls_config
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # LOGSTASH KEYSTORE
+    # ================================================================
+
+    - name: Gather Logstash keystore setting names
+      ansible.builtin.shell:
+        cmd: |
+          if [ -x /usr/share/logstash/bin/logstash-keystore ]; then
+            /usr/share/logstash/bin/logstash-keystore list 2>&1 || true
+          elif [ -x /usr/bin/logstash-keystore ]; then
+            /usr/bin/logstash-keystore list 2>&1 || true
+          else
+            echo "logstash-keystore executable not found"
+          fi
+      register: logstash_keystore_names
+      changed_when: false
+      failed_when: false
+      when:
+        - is_logstash_host
+        - logstash_keystore is exists
+
+
+    # ================================================================
+    # LOGSTASH TLS FILES
+    # ================================================================
+
+    - name: Find Logstash TLS related files
+      ansible.builtin.shell:
+        cmd: |
+          find /etc/logstash \
+            -type f \
+            \( \
+              -iname '*.pem' \
+              -o -iname '*.crt' \
+              -o -iname '*.cer' \
+              -o -iname '*.key' \
+              -o -iname '*.p12' \
+              -o -iname '*.pfx' \
+              -o -iname '*.jks' \
+            \) \
+            -printf '%p\t%u:%g\t%M\t%s bytes\n' \
+            2>/dev/null || true
+      register: logstash_tls_files
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    - name: Inspect Logstash PEM certificates
+      ansible.builtin.shell:
+        cmd: |
+          for cert in \
+            $(find /etc/logstash \
+              -type f \
+              \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \) \
+              2>/dev/null); do
+
+            echo
+            echo "================================================================"
+            echo "CERTIFICATE: ${cert}"
+            echo "================================================================"
+
+            openssl x509 \
+              -in "${cert}" \
+              -noout \
+              -subject \
+              -issuer \
+              -serial \
+              -dates \
+              -fingerprint -sha256 \
+              -ext subjectAltName \
+              -ext extendedKeyUsage \
+              -ext keyUsage \
+              2>&1 || true
+          done
+      register: logstash_certificate_details
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # LOGSTASH NETWORK LISTENERS
+    # ================================================================
+
+    - name: Inspect configured Logstash listeners
+      ansible.builtin.shell:
+        cmd: |
+          echo "----- All Logstash listening sockets -----"
+          ss -lntup | grep -E 'java|logstash' || true
+
+          echo
+
+          {% for port in logstash_ports %}
+          echo "----- Expected Logstash port {{ port }} -----"
+          ss -lntup | grep -E '[:.]{{ port }}([[:space:]]|$)' || true
+          echo
+          {% endfor %}
+      register: logstash_listeners
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # FILE PERMISSIONS FOR CONFIGURATION / TLS MATERIAL
+    # ================================================================
+
+    - name: Inspect Elasticsearch configuration directory
+      ansible.builtin.command:
+        cmd: ls -la /etc/elasticsearch
+      register: es_directory_listing
+      changed_when: false
+      failed_when: false
+      when: is_elasticsearch_host
+
+
+    - name: Inspect Kibana configuration directory
+      ansible.builtin.command:
+        cmd: ls -la /etc/kibana
+      register: kibana_directory_listing
+      changed_when: false
+      failed_when: false
+      when: is_kibana_host
+
+
+    - name: Inspect Logstash configuration directory
+      ansible.builtin.command:
+        cmd: ls -la /etc/logstash
+      register: logstash_directory_listing
+      changed_when: false
+      failed_when: false
+      when: is_logstash_host
+
+
+    # ================================================================
+    # DISPLAY BASIC HOST INFORMATION
+    # ================================================================
+
+    - name: Display host / network information
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " HOST / NETWORK INFORMATION - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - "{{ hostname_output.stdout }}"
+          - ""
+          - "IP ADDRESSES:"
+          - "{{ ip_addresses.stdout }}"
+          - ""
+          - "IPv4 ROUTES:"
+          - "{{ ip_routes.stdout }}"
+          - ""
+          - "IPv6 ROUTES:"
+          - "{{ ipv6_routes.stdout }}"
+          - ""
+          - "DNS CONFIGURATION:"
+          - "{{ dns_configuration.stdout }}"
+          - ""
+          - "LISTENING SOCKETS:"
+          - "{{ listening_sockets.stdout }}"
+          - ""
+          - "================================================================"
+
+
+    # ================================================================
+    # DISPLAY FIREWALL INFORMATION
+    # ================================================================
+
+    - name: Display firewall information
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " LOCAL FIREWALL INFORMATION - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - "NFTABLES:"
+          - "{{ nftables_rules.stdout | default('Not available') }}"
+          - ""
+          - "IPTABLES:"
+          - "{{ iptables_rules.stdout | default('Not available') }}"
+          - ""
+          - "FIREWALLD:"
+          - "{{ firewalld_rules.stdout | default('Not available') }}"
+          - ""
+          - "================================================================"
+
+
+    # ================================================================
+    # DISPLAY ELASTICSEARCH INFORMATION
+    # ================================================================
+
+    - name: Display Elasticsearch information
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " ELASTICSEARCH INFORMATION - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - "VERSION:"
+          - "{{ elasticsearch_version.stdout | default('Not an Elasticsearch host') }}"
+          - ""
+          - "SYSTEMD:"
+          - "{{ es_systemd.stdout | default('Not an Elasticsearch host') }}"
+          - ""
+          - "NETWORK / HTTP / TRANSPORT / TLS CONFIGURATION:"
+          - "{{ es_network_tls_config.stdout | default('Not an Elasticsearch host') }}"
+          - ""
+          - "SECURITY CONFIGURATION:"
+          - "{{ es_security_config.stdout | default('Not an Elasticsearch host') }}"
+          - ""
+          - "CLUSTER / DISCOVERY:"
+          - "{{ es_cluster_config.stdout | default('Not an Elasticsearch host') }}"
+          - ""
+          - "ELASTICSEARCH KEYSTORE - SETTING NAMES ONLY:"
+          - "{{ es_keystore_names.stdout | default('Not available') }}"
+          - ""
+          - "TLS FILES:"
+          - "{{ es_tls_files.stdout | default('Not available') }}"
+          - ""
+          - "CERTIFICATE REFERENCES:"
+          - "{{ es_certificate_references.stdout | default('Not available') }}"
+          - ""
+          - "CERTIFICATE DETAILS:"
+          - "{{ es_certificate_details.stdout | default('Not available') }}"
+          - ""
+          - "HTTP LISTENER:"
+          - "{{ es_http_listener.stdout | default('Not available') }}"
+          - ""
+          - "TRANSPORT LISTENER:"
+          - "{{ es_transport_listener.stdout | default('Not available') }}"
+          - ""
+          - "================================================================"
+      when: is_elasticsearch_host
+
+
+    # ================================================================
+    # DISPLAY KIBANA INFORMATION
+    # ================================================================
+
+    - name: Display Kibana information
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " KIBANA INFORMATION - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - "VERSION:"
+          - "{{ kibana_version.stdout | default('Not a Kibana host') }}"
+          - ""
+          - "SYSTEMD:"
+          - "{{ kibana_systemd.stdout | default('Not a Kibana host') }}"
+          - ""
+          - "ELASTICSEARCH CONNECTION CONFIGURATION:"
+          - "{{ kibana_es_config.stdout | default('Not available') }}"
+          - ""
+          - "KIBANA SERVER CONFIGURATION:"
+          - "{{ kibana_server_config.stdout | default('Not available') }}"
+          - ""
+          - "AUTHENTICATION CONFIGURATION:"
+          - "{{ kibana_auth_config.stdout | default('Not available') }}"
+          - ""
+          - "KIBANA KEYSTORE - SETTING NAMES ONLY:"
+          - "{{ kibana_keystore_names.stdout | default('Not available') }}"
+          - ""
+          - "TLS FILES:"
+          - "{{ kibana_tls_files.stdout | default('Not available') }}"
+          - ""
+          - "CERTIFICATE DETAILS:"
+          - "{{ kibana_certificate_details.stdout | default('Not available') }}"
+          - ""
+          - "KIBANA LISTENER:"
+          - "{{ kibana_listener.stdout | default('Not available') }}"
+          - ""
+          - "================================================================"
+      when: is_kibana_host
+
+
+    # ================================================================
+    # DISPLAY LOGSTASH INFORMATION
+    # ================================================================
+
+    - name: Display Logstash information
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " LOGSTASH INFORMATION - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - "VERSION:"
+          - "{{ logstash_version.stdout | default('Not a Logstash host') }}"
+          - ""
+          - "SYSTEMD:"
+          - "{{ logstash_systemd.stdout | default('Not a Logstash host') }}"
+          - ""
+          - "MAIN CONFIGURATION:"
+          - "{{ logstash_main_config.stdout | default('Not available') }}"
+          - ""
+          - "PIPELINE CONFIGURATION:"
+          - "{{ logstash_pipeline_config.stdout | default('Not available') }}"
+          - ""
+          - "ELASTICSEARCH / TLS CONFIGURATION:"
+          - "{{ logstash_tls_config.stdout | default('Not available') }}"
+          - ""
+          - "LOGSTASH KEYSTORE - SETTING NAMES ONLY:"
+          - "{{ logstash_keystore_names.stdout | default('Not available') }}"
+          - ""
+          - "TLS FILES:"
+          - "{{ logstash_tls_files.stdout | default('Not available') }}"
+          - ""
+          - "CERTIFICATE DETAILS:"
+          - "{{ logstash_certificate_details.stdout | default('Not available') }}"
+          - ""
+          - "LISTENERS:"
+          - "{{ logstash_listeners.stdout | default('Not available') }}"
+          - ""
+          - "================================================================"
+      when: is_logstash_host
+
+
+    # ================================================================
+    # FINAL MACHINE-READABLE-ISH SUMMARY
+    # ================================================================
+
+    - name: Display collection summary
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "================================================================"
+          - " COLLECTION COMPLETE - {{ inventory_hostname }}"
+          - "================================================================"
+          - ""
+          - "Elasticsearch host: {{ is_elasticsearch_host }}"
+          - "Kibana host:        {{ is_kibana_host }}"
+          - "Logstash host:      {{ is_logstash_host }}"
+          - ""
+          - "NO CONNECTION TESTS WERE PERFORMED."
+          - ""
+          - "Information collected:"
+          - "  - Hostname / FQDN"
+          - "  - IPv4 / IPv6 addresses"
+          - "  - IPv4 / IPv6 routing"
+          - "  - DNS resolver configuration"
+          - "  - Local listening sockets"
+          - "  - Local firewall configuration"
+          - "  - Product versions"
+          - "  - systemd service definitions and overrides"
+          - "  - Elasticsearch HTTP configuration"
+          - "  - Elasticsearch transport configuration"
+          - "  - Elasticsearch discovery configuration"
+          - "  - Elasticsearch security/TLS configuration"
+          - "  - Elasticsearch keystore setting names"
+          - "  - Elasticsearch TLS files and certificate metadata"
+          - "  - Kibana -> Elasticsearch configuration"
+          - "  - Kibana server/TLS configuration"
+          - "  - Kibana authentication configuration"
+          - "  - Kibana keystore setting names"
+          - "  - Kibana TLS files and certificate metadata"
+          - "  - Logstash main configuration"
+          - "  - Logstash pipeline configurations"
+          - "  - Logstash -> Elasticsearch configuration"
+          - "  - Logstash TLS configuration"
+          - "  - Logstash keystore setting names"
+          - "  - Logstash TLS files and certificate metadata"
+          - "  - Logstash listeners"
+          - ""
+          - "================================================================"
